@@ -1,0 +1,986 @@
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Five Nights at Freddy's 2 - Web Engine</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        body {
+            background-color: #030303;
+            color: #ffffff;
+            font-family: 'Courier New', Courier, monospace;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        #game-container {
+            position: relative;
+            width: 1024px;
+            height: 768px;
+            box-shadow: 0 0 100px rgba(0, 0, 0, 0.8), inset 0 0 40px rgba(0, 0, 0, 1);
+            background: #000;
+            overflow: hidden;
+            animation: crt-flicker 0.15s infinite;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+
+        /* CRT Post-Processing Effects */
+        .crt-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0.35) 100%);
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .scanlines {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(
+                rgba(18, 16, 16, 0) 50%, 
+                rgba(0, 0, 0, 0.25) 50%
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 11;
+            opacity: 0.85;
+        }
+
+        /* Screen Flickering Animation */
+        @keyframes crt-flicker {
+            0% { opacity: 0.98; }
+            50% { opacity: 1; }
+            100% { opacity: 0.99; }
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="gameCanvas" width="1024" height="768"></canvas>
+        
+        <div class="crt-overlay"></div>
+        <div class="scanlines"></div>
+    </div>
+
+    <script>
+        /**
+         * Five Nights at Freddy's 2 - Production Engine Implementation
+         * Complete architectural implementation featuring modular state machines,
+         * real-time procedural perspective drawing, precise AI loop intervals,
+         * and standard Web Audio API synthesis.
+         */
+
+        // ============================================================================
+        // 1. GLOBAL ENGINE STATE & CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            FPS: 60,
+            WIDTH: 1024,
+            HEIGHT: 768,
+            OFFICE_WIDTH: 1600, // Panoramic scrolling boundary
+            NIGHT_DURATION: 360000, // 6 minutes total (60,000ms per hour)
+            AI_TICK_RATE: 5000, // Every 5 seconds animatronics attempt a move
+        };
+
+        const STATE = {
+            currentNight: 1,
+            time: 0, // In-game milliseconds
+            currentHour: 12,
+            gameOver: false,
+            gameWon: false,
+            jumpscaredBy: null,
+            jumpscareFrame: 0,
+
+            // Systems
+            officePanX: 288, // Center initialization
+            flashlightBattery: 100,
+            flashlightOn: false,
+            maskEquipped: false,
+            maskTransition: 0, // 0 = off, 1 = fully on
+            monitorActive: false,
+            monitorTransition: 0, // 0 = closed, 1 = open
+            currentCamera: "CAM11",
+            musicBoxWind: 100, // Percentage
+            ventLightLeft: false,
+            ventLightRight: false,
+            
+            // Trigger States
+            blackoutActive: false,
+            blackoutTimer: 0,
+            forcedMaskTimer: 0,
+        };
+
+        // Camera Definitions Map
+        const CAMERAS = {
+            CAM01: { name: "Party Room 1", x: 730, y: 500 },
+            CAM02: { name: "Party Room 2", x: 850, y: 500 },
+            CAM03: { name: "Party Room 3", x: 730, y: 580 },
+            CAM04: { name: "Party Room 4", x: 850, y: 580 },
+            CAM05: { name: "Left Air Vent", x: 680, y: 640 },
+            CAM06: { name: "Right Air Vent", x: 900, y: 640 },
+            CAM07: { name: "Main Hallway", x: 790, y: 440 },
+            CAM08: { name: "Parts & Service", x: 670, y: 400 },
+            CAM09: { name: "Show Stage", x: 790, y: 320 },
+            CAM10: { name: "Game Area", x: 910, y: 400 },
+            CAM11: { name: "Prize Corner", x: 790, y: 220 },
+            CAM12: { name: "Kids Cove", x: 930, y: 260 }
+        };
+
+        // ============================================================================
+        // 2. AUDIO SYNTHESIS ENGINE (Web Audio API Procedural Generation)
+        // ============================================================================
+        const AudioEngine = {
+            ctx: null,
+            masterGain: null,
+            loops: {},
+
+            init() {
+                this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                this.masterGain = this.ctx.createGain();
+                this.masterGain.gain.setValueAtTime(0.4, this.ctx.currentTime);
+                this.masterGain.connect(this.ctx.destination);
+                this.startAmbience();
+            },
+
+            playTone(freq, type, duration, volume = 1) {
+                if (!this.ctx) return;
+                let osc = this.ctx.createOscillator();
+                let gain = this.ctx.createGain();
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                gain.gain.setValueAtTime(volume, this.ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.00001, this.ctx.currentTime + duration);
+                osc.connect(gain);
+                gain.connect(this.masterGain);
+                osc.start();
+                osc.stop(this.ctx.currentTime + duration);
+            },
+
+            startAmbience() {
+                // Procedural low hum & fan sound
+                if (!this.ctx) return;
+                
+                // Brown noise generation for industrial hum
+                let bufferSize = 10 * this.ctx.sampleRate,
+                    noiseBuffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate),
+                    output = noiseBuffer.getChannelData(0);
+                let lastOut = 0.0;
+                for (let i = 0; i < bufferSize; i++) {
+                    let white = Math.random() * 2 - 1;
+                    output[i] = (lastOut + (0.02 * white)) / 1.02;
+                    lastOut = output[i];
+                    output[i] *= 3.5; 
+                }
+
+                let noise = this.ctx.createBufferSource();
+                noise.buffer = noiseBuffer;
+                noise.loop = true;
+                
+                let filter = this.ctx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.setValueAtTime(120, this.ctx.currentTime);
+
+                let noiseGain = this.ctx.createGain();
+                noiseGain.gain.setValueAtTime(0.15, this.ctx.currentTime);
+
+                noise.connect(filter);
+                filter.connect(noiseGain);
+                noiseGain.connect(this.masterGain);
+                noise.start(0);
+                this.loops.ambience = noise;
+            },
+
+            playStatic(duration = 0.1, vol = 0.08) {
+                if (!this.ctx) return;
+                let bufferSize = this.ctx.sampleRate * duration;
+                let buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+                let data = buffer.getChannelData(0);
+                for (let i = 0; i < bufferSize; i++) {
+                    data[i] = Math.random() * 2 - 1;
+                }
+                let source = this.ctx.createBufferSource();
+                source.buffer = buffer;
+                let gain = this.ctx.createGain();
+                gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+                source.connect(gain);
+                gain.connect(this.masterGain);
+                source.start();
+            },
+
+            triggerSFX(type) {
+                switch(type) {
+                    case 'click': this.playTone(600, 'square', 0.05, 0.2); break;
+                    case 'light': this.playTone(80, 'sine', 0.1, 0.5); break;
+                    case 'mask_on': this.playTone(150, 'triangle', 0.2, 0.4); break;
+                    case 'mask_off': this.playTone(220, 'triangle', 0.15, 0.4); break;
+                    case 'flip': this.playTone(400, 'sine', 0.15, 0.3); break;
+                    case 'scare':
+                        // Complex modular screaming oscillator cluster
+                        for(let i=0; i<5; i++) {
+                            this.playTone(100 + Math.random()*250, 'sawtooth', 1.8, 0.8);
+                            this.playTone(50 + Math.random()*50, 'square', 1.8, 0.6);
+                        }
+                        break;
+                }
+            }
+        };
+
+        // ============================================================================
+        // 3. ANIMATRONICS AI STATE MODULE
+        // ============================================================================
+        const AI_ENGINE = {
+            levels: {
+                1: { TFreddy:1, TBonnie:3, TChica:2, Mangle:1, BB:1, Puppet:5, WFreddy:0, WBonnie:0, WChica:0, WFoxy:0, GFreddy:0, SBonnie:0, SFreddy:0 },
+                2: { TFreddy:3, TBonnie:4, TChica:3, Mangle:3, BB:4, Puppet:7, WFreddy:1, WBonnie:1, WChica:1, WFoxy:2, GFreddy:0, SBonnie:0, SFreddy:0 },
+                3: { TFreddy:4, TBonnie:5, TChica:4, Mangle:5, BB:6, Puppet:10, WFreddy:2, WBonnie:3, WChica:2, WFoxy:4, GFreddy:1, SBonnie:1, SFreddy:1 }
+            },
+            
+            registry: {},
+
+            init() {
+                const lvls = this.levels[STATE.currentNight] || this.levels;
+                
+                const config = [
+                    { name: "Toy Freddy", id: "TFreddy", path: ["CAM09", "CAM10", "Hallway", "Office"] },
+                    { name: "Toy Bonnie", id: "TBonnie", path: ["CAM09", "CAM03", "CAM04", "CAM06", "Office"] },
+                    { name: "Toy Chica", id: "TChica", path: ["CAM09", "CAM01", "CAM02", "CAM05", "Office"] },
+                    { name: "Mangle", id: "Mangle", path: ["CAM12", "CAM11", "CAM02", "CAM01", "CAM06", "Office"] },
+                    { name: "Balloon Boy", id: "BB", path: ["CAM10", "CAM05", "Office"] },
+                    { name: "Puppet", id: "Puppet", path: ["CAM11", "Office"] },
+                    { name: "Withered Freddy", id: "WFreddy", path: ["CAM08", "CAM07", "Hallway", "Office"] },
+                    { name: "Withered Bonnie", id: "WBonnie", path: ["CAM08", "CAM07", "CAM01", "CAM05", "Office"] },
+                    { name: "Withered Chica", id: "WChica", path: ["CAM08", "CAM07", "CAM02", "CAM06", "Office"] },
+                    { name: "Withered Foxy", id: "WFoxy", path: ["Hallway", "Office"] },
+                    { name: "Golden Freddy", id: "GFreddy", path: ["Office"] },
+                    { name: "Shadow Bonnie", id: "SBonnie", path: ["Office"] },
+                    { name: "Shadow Freddy", id: "SFreddy", path: ["CAM08"] }
+                ];
+
+                config.forEach(char => {
+                    this.registry[char.id] = {
+                        name: char.name,
+                        path: char.path,
+                        currentIdx: 0,
+                        location: char.path,
+                        aiLvl: lvls[char.id],
+                        inOffice: false,
+                        forcedMaskDefenseTimer: 0
+                    };
+                });
+            },
+
+            tick() {
+                if(STATE.gameOver || STATE.gameWon) return;
+
+                // Unwind Music Box
+                let boxDecay = 1.2 + (STATE.currentNight * 0.3);
+                if(!STATE.monitorActive || STATE.currentCamera !== "CAM11") {
+                    STATE.musicBoxWind = Math.max(0, STATE.musicBoxWind - boxDecay);
+                }
+
+                // Process Global Puppet Tracking
+                if(STATE.musicBoxWind <= 0) {
+                    this.registry["Puppet"].location = "Office";
+                    this.registry["Puppet"].inOffice = true;
+                }
+
+                // Cycle through AI configurations
+                for(let id in this.registry) {
+                    let anim = this.registry[id];
+                    if(anim.aiLvl === 0 || id === "Puppet") continue;
+
+                    // Roll Movement Opportunity Check
+                    let roll = Math.random() * 20;
+                    if(roll <= anim.aiLvl) {
+                        this.advanceAnimatronic(id, anim);
+                    }
+                }
+            },
+
+            advanceAnimatronic(id, anim) {
+                if(anim.inOffice) return;
+
+                // Foxy Mechanics Override (Flashlight Stun Logic)
+                if(id === "WFoxy" && anim.location === "Hallway" && STATE.flashlightOn && STATE.officePanX > 100 && STATE.officePanX < 500) {
+                    return; // Foxy is stunned by active hallway flashlight vectors
+                }
+
+                // Normal movement path calculations
+                let nextIdx = anim.currentIdx + 1;
+                if(nextIdx < anim.path.length) {
+                    anim.currentIdx = nextIdx;
+                    anim.location = anim.path[nextIdx];
+                    
+                    if(anim.location === "Office") {
+                        anim.inOffice = true;
+                        if(id !== "WFoxy" && id !== "GFreddy") {
+                            // Trigger immediate tactical office forced entry event
+                            STATE.blackoutActive = true;
+                            STATE.blackoutTimer = 120; // 2 seconds at 60fps
+                            anim.forcedMaskDefenseTimer = 120;
+                        }
+                    }
+                }
+            }
+        };
+
+        // ============================================================================
+        // 4. RENDERING & PIPELINE CONTROLLERS
+        // ============================================================================
+        const VisualEngine = {
+            canvas: null,
+            ctx: null,
+            fanAngle: 0,
+
+            init() {
+                this.canvas = document.getElementById("gameCanvas");
+                this.ctx = this.canvas.getContext("2d");
+                window.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+                window.addEventListener('keydown', (e) => this.handleKeyDown(e));
+                window.addEventListener('keyup', (e) => this.handleKeyUp(e));
+                this.canvas.addEventListener('click', (e) => this.handleMouseClick(e));
+            },
+
+            handleMouseMove(e) {
+                if(STATE.monitorActive || STATE.gameOver) return;
+                let rect = this.canvas.getBoundingClientRect();
+                let mouseX = (e.clientX - rect.left) * (CONFIG.WIDTH / rect.width);
+                
+                // Edge scrolling computations for dynamic office panorama viewport tracking
+                if (mouseX < CONFIG.WIDTH * 0.2) {
+                    STATE.officePanX = Math.max(0, STATE.officePanX - 18);
+                } else if (mouseX > CONFIG.WIDTH * 0.8) {
+                    STATE.officePanX = Math.min(CONFIG.OFFICE_WIDTH - CONFIG.WIDTH, STATE.officePanX + 18);
+                }
+            },
+
+            handleKeyDown(e) {
+                if(STATE.gameOver) return;
+                if(e.code === "ControlLeft" || e.code === "ControlRight") {
+                    if(!STATE.maskEquipped && !STATE.monitorActive && STATE.flashlightBattery > 0) {
+                        if(!STATE.flashlightOn) AudioEngine.triggerSFX('light');
+                        STATE.flashlightOn = true;
+                    }
+                }
+                if(e.code === "Space") {
+                    // Mask Toggle Execution Shortcut Spacebar
+                    this.toggleMask();
+                }
+            },
+
+            handleKeyUp(e) {
+                if(e.code === "ControlLeft" || e.code === "ControlRight") {
+                    STATE.flashlightOn = false;
+                }
+            },
+
+            handleMouseClick(e) {
+                if(STATE.gameOver) return;
+                let rect = this.canvas.getBoundingClientRect();
+                let x = (e.clientX - rect.left) * (CONFIG.WIDTH / rect.width);
+                let y = (e.clientY - rect.top) * (CONFIG.HEIGHT / rect.height);
+
+                // UI Target Space Maps Intersections
+                // Monitor Hitbox Region Check
+                if(y > CONFIG.HEIGHT - 70 && x > CONFIG.WIDTH * 0.5) {
+                    this.toggleMonitor();
+                    return;
+                }
+                // Mask Hitbox Region Check
+                if(y > CONFIG.HEIGHT - 70 && x < CONFIG.WIDTH * 0.5) {
+                    this.toggleMask();
+                    return;
+                }
+
+                // Camera Interaction Intersection Evaluation inside Mini-Map
+                if(STATE.monitorActive && STATE.monitorTransition === 1) {
+                    for(let key in CAMERAS) {
+                        let cam = CAMERAS[key];
+                        if(x >= cam.x && x <= cam.x + 55 && y >= cam.y && y <= cam.y + 35) {
+                            STATE.currentCamera = key;
+                            AudioEngine.triggerSFX('click');
+                            AudioEngine.playStatic(0.15, 0.12);
+                            break;
+                        }
+                    }
+                    
+                    // Wind Music Box UI Area Intersect (Only valid on CAM11)
+                    if(STATE.currentCamera === "CAM11" && x > 750 && x < 950 && y > 120 && y < 170) {
+                        STATE.musicBoxWind = Math.min(100, STATE.musicBoxWind + 15);
+                        AudioEngine.playTone(300, 'sine', 0.1, 0.2);
+                    }
+                }
+
+                // Vent Light Buttons Bounds Vector Intersection Checks
+                if(!STATE.monitorActive && !STATE.maskEquipped) {
+                    let relativeX = x + STATE.officePanX;
+                    // Left Vent Button Space Bounds
+                    if(relativeX > 150 && relativeX < 230 && y > 350 && y < 450) {
+                        STATE.ventLightLeft = !STATE.ventLightLeft;
+                        STATE.ventLightRight = false;
+                        AudioEngine.triggerSFX('light');
+                    }
+                    // Right Vent Button Space Bounds
+                    if(relativeX > 1350 && relativeX < 1430 && y > 350 && y < 450) {
+                        STATE.ventLightRight = !STATE.ventLightRight;
+                        STATE.ventLightLeft = false;
+                        AudioEngine.triggerSFX('light');
+                    }
+                }
+            },
+
+            toggleMask() {
+                if(STATE.monitorActive || STATE.monitorTransition > 0) return;
+                STATE.maskEquipped = !STATE.maskEquipped;
+                AudioEngine.triggerSFX(STATE.maskEquipped ? 'mask_on' : 'mask_off');
+            },
+
+            toggleMonitor() {
+                if(STATE.maskEquipped || STATE.maskTransition > 0) return;
+                STATE.monitorActive = !STATE.monitorActive;
+                AudioEngine.triggerSFX('flip');
+                AudioEngine.playStatic(0.2, 0.1);
+            },
+
+            updateTransitions() {
+                // Linear Mask Transition Rate
+                if(STATE.maskEquipped && STATE.maskTransition < 1) STATE.maskTransition = Math.min(1, STATE.maskTransition + 0.15);
+                if(!STATE.maskEquipped && STATE.maskTransition > 0) STATE.maskTransition = Math.max(0, STATE.maskTransition - 0.15);
+
+                // Linear Monitor Transition Rate
+                if(STATE.monitorActive && STATE.monitorTransition < 1) STATE.monitorTransition = Math.min(1, STATE.monitorTransition + 0.15);
+                if(!STATE.monitorActive && STATE.monitorTransition > 0) STATE.monitorTransition = Math.max(0, STATE.monitorTransition - 0.15);
+
+                // Decrement Active Flashlight Fuel Cell Level Vectors
+                if(STATE.flashlightOn && STATE.flashlightBattery > 0) {
+                    STATE.flashlightBattery = Math.max(0, STATE.flashlightBattery - 0.008);
+                    if(STATE.flashlightBattery <= 0) STATE.flashlightOn = false;
+                }
+
+                this.fanAngle += 0.25; // Continuous rotation tracking vector incrementation
+            },
+
+            render() {
+                this.ctx.fillStyle = "#000000";
+                this.ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+                if(STATE.jumpscaredBy) {
+                    this.renderJumpscare();
+                    return;
+                }
+
+                this.ctx.save();
+                // Shift camera space transform matrices coordinates across linear panoramas
+                if(!STATE.monitorActive) {
+                    this.ctx.translate(-STATE.officePanX, 0);
+                    this.renderOffice();
+                    this.ctx.restore();
+                } else {
+                    this.ctx.restore();
+                    this.renderCameras();
+                }
+
+                // Composite Interface System layers
+                this.renderOverlays();
+                this.renderHUD();
+            },
+
+            renderOffice() {
+                let c = this.ctx;
+                
+                // Render Floor/Walls Blueprint System Structure
+                c.fillStyle = "#15151c";
+                c.fillRect(0, 0, CONFIG.OFFICE_WIDTH, CONFIG.HEIGHT);
+                
+                // Ceiling Projection
+                c.fillStyle = "#09090b";
+                c.fillRect(0, 0, CONFIG.OFFICE_WIDTH, 180);
+
+                // Strategic Horizon Line Dividing Checkers 
+                c.fillStyle = "#222";
+                c.fillRect(0, 500, CONFIG.OFFICE_WIDTH, 268);
+
+                // Draw Central Hallway Open Geometry Void Frame
+                c.fillStyle = "#020202";
+                c.fillRect(500, 150, 600, 350);
+
+                // Flashlight Ray Cast Overlay Calculations inside Central Void
+                if(STATE.flashlightOn) {
+                    let grad = c.createRadialGradient(800, 325, 20, 800, 325, 300);
+                    grad.addColorStop(0, 'rgba(255, 255, 230, 0.45)');
+                    grad.addColorStop(0.4, 'rgba(230, 230, 180, 0.15)');
+                    grad.addColorStop(1, 'rgba(0,0,0,0)');
+                    c.fillStyle = grad;
+                    c.fillRect(500, 150, 600, 350);
+
+                    // Conditional Hallway Inhabitant Draw Pipelines
+                    this.drawHallwayOccupants(c);
+                }
+
+                // Draw Left/Right Structural Vents Visual Compartments
+                // Left Vent Base Wall Aperture Frame
+                c.fillStyle = STATE.ventLightLeft ? "#3a3a45" : "#050507";
+                c.fillRect(80, 350, 120, 220);
+                if(STATE.ventLightLeft) this.drawVentOccupant(c, "Left");
+
+                // Right Vent Base Wall Aperture Frame
+                c.fillStyle = STATE.ventLightRight ? "#3a3a45" : "#050507";
+                c.fillRect(1400, 350, 120, 220);
+                if(STATE.ventLightRight) this.drawVentOccupant(c, "Right");
+
+                // Desk Geometry Structure Matrix Construction
+                c.fillStyle = "#0c0806";
+                c.fillRect(400, 480, 800, 240);
+                c.fillStyle = "#1e140f";
+                c.fillRect(420, 490, 760, 15);
+
+                // Procedural desk elements (Desk Fan Frame Vectors)
+                c.save();
+                c.translate(800, 440);
+                c.fillStyle = "#111111";
+                c.fillRect(-10, 0, 20, 50); // Stand
+                c.beginPath();
+                c.arc(0, 0, 35, 0, Math.PI * 2);
+                c.fillStyle = "#222222";
+                c.fill();
+                c.strokeStyle = "#333";
+                c.stroke();
+                
+                // Fan Blades
+                c.rotate(this.fanAngle);
+                for(let i=0; i<3; i++) {
+                    c.rotate((Math.PI * 2) / 3);
+                    c.fillStyle = "#000000";
+                    c.fillRect(-6, -30, 12, 30);
+                }
+                c.restore();
+
+                // Localized Forced Office Presence Engine Processing Rendering
+                if(STATE.blackoutActive) {
+                    c.fillStyle = `rgba(0,0,0,${Math.min(1, STATE.blackoutTimer/60)})`;
+                    c.fillRect(0,0, CONFIG.OFFICE_WIDTH, CONFIG.HEIGHT);
+                    
+                    // Draw Intruder Silhouette inside blackouts
+                    c.fillStyle = "#0c0c0c";
+                    c.beginPath();
+                    c.arc(800, 400, 80, 0, Math.PI*2);
+                    c.fill();
+                }
+            },
+
+            drawHallwayOccupants(c) {
+                // Intersect logic loops checking active hallway location parameters
+                for(let id in AI_ENGINE.registry){
+                    let anim = AI_ENGINE.registry[id];
+                    if(anim.location === "Hallway") {
+                        c.fillStyle = "#4a3b32"; // Dark raw brown silhouette shapes
+                        c.fillRect(750, 250, 100, 200); 
+                        c.fillStyle = "#ff0000"; // Glowing structural eye matrices
+                        c.fillRect(775, 280, 6, 6);
+                        c.fillRect(815, 280, 6, 6);
+                    }
+                }
+            },
+
+            drawVentOccupant(c, side) {
+                let xPos = (side === "Left") ? 130 : 1450;
+                // Verify structural mapping to actual localized vent components
+                for(let id in AI_ENGINE.registry) {
+                    let anim = AI_ENGINE.registry[id];
+                    if((side === "Left" && anim.location === "CAM05") || (side === "Right" && anim.location === "CAM06")) {
+                        c.fillStyle = "#fff";
+                        c.font = "bold 14px Arial";
+                        c.fillText("ALERT", xPos - 20, 420);
+                    }
+                }
+            },
+
+            renderCameras() {
+                let c = this.ctx;
+                // Base viewport clean feed buffer block
+                c.fillStyle = "#050805";
+                c.fillRect(0,0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+                // Procedural Environment Vector Rendering Map
+                c.fillStyle = "#111";
+                c.fillRect(100, 100, 500, 400);
+
+                // Render Text Information HUD Elements
+                c.fillStyle = "#00ff00";
+                c.font = "20px 'Courier New'";
+                c.fillText(`FEED: ${CAMERAS[STATE.currentCamera].name}`, 120, 140);
+
+                // Print Animatronic Presence Signatures on Feed Frame
+                let offset = 0;
+                for(let id in AI_ENGINE.registry) {
+                    let anim = AI_ENGINE.registry[id];
+                    if(anim.location === STATE.currentCamera) {
+                        c.fillStyle = "#ff3333";
+                        c.fillRect(150 + offset, 300, 60, 120);
+                        c.fillStyle = "#fff";
+                        c.font = "10px Arial";
+                        c.fillText(anim.name, 150+offset, 440);
+                        offset += 90;
+                    }
+                }
+
+                // UI Special Interaction Handle for Music Box Screen
+                if(STATE.currentCamera === "CAM11") {
+                    c.fillStyle = "#224422";
+                    c.fillRect(750, 120, 200, 50);
+                    c.fillStyle = "#ffffff";
+                    c.font = "bold 14px sans-serif";
+                    c.fillText("HOLD TO WIND BOX", 780, 150);
+                    
+                    // Render continuous linear breakdown tracking bar gauge meters
+                    c.fillStyle = "red";
+                    c.fillRect(750, 180, 200, 10);
+                    c.fillStyle = "green";
+                    c.fillRect(750, 180, STATE.musicBoxWind * 2, 10);
+                }
+
+                // Draw Interactive Camera Grid Interface Layout Map overlays
+                this.renderMiniMap(c);
+            },
+
+            renderMiniMap(c) {
+                c.save();
+                c.strokeStyle = "#ffffff";
+                c.lineWidth = 2;
+                
+                // Draw Global Matrix Outlines
+                c.strokeRect(700, 250, 250, 420);
+
+                for(let key in CAMERAS) {
+                    let cam = CAMERAS[key];
+                    let active = (STATE.currentCamera === key);
+                    
+                    c.fillStyle = active ? "#ffff00" : "#222222";
+                    c.fillRect(cam.x, cam.y, 55, 35);
+                    c.strokeRect(cam.x, cam.y, 55, 35);
+
+                    c.fillStyle = active ? "#000000" : "#ffffff";
+                    c.font = "bold 11px Arial";
+                    c.fillText(key, cam.x + 12, cam.y + 22);
+                }
+                c.restore();
+            },
+
+            renderOverlays() {
+                let c = this.ctx;
+
+                // Monitor Flip Mechanical Animations Masks Plane Render Layer
+                if(STATE.monitorTransition > 0) {
+                    c.fillStyle = `rgba(0, 0, 0, ${STATE.monitorTransition})`;
+                    let heightOffset = (1 - STATE.monitorTransition) * CONFIG.HEIGHT;
+                    c.fillRect(0, heightOffset, CONFIG.WIDTH, CONFIG.HEIGHT);
+                }
+
+                // Freddy Mask Mechanical Overlay Filter Mesh Layer Render Pipeline
+                if(STATE.maskTransition > 0) {
+                    c.save();
+                    c.globalAlpha = STATE.maskTransition;
+                    
+                    // Vignette eyehole apertures paths composite masks clipping
+                    c.fillStyle = "rgba(20, 10, 5, 0.96)";
+                    c.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+                    // Left Eyehole Void Arc
+                    c.globalCompositeOperation = 'destination-out';
+                    c.beginPath(); c.arc(324, 384, 140, 0, Math.PI*2); c.fill();
+                    
+                    // Right Eyehole Void Arc
+                    c.beginPath(); c.arc(700, 384, 140, 0, Math.PI*2); c.fill();
+
+                    c.restore();
+                }
+
+                // Standard Engine Realtime Camera Static Interferences Shader Node Emulator
+                if(STATE.monitorActive) {
+                    c.save();
+                    c.globalAlpha = 0.08 + Math.random() * 0.07;
+                    for (let i = 0; i < CONFIG.HEIGHT; i += 4) {
+                        c.fillStyle = Math.random() > 0.5 ? "#fff" : "#000";
+                        c.fillRect(0, i, CONFIG.WIDTH, Math.random() * 4);
+                    }
+                    c.restore();
+                }
+            },
+
+            renderHUD() {
+                let c = this.ctx;
+
+                // Draw Standard Upper Left Time Matrix Indexes
+                c.fillStyle = "#ffffff";
+                c.font = "32px 'Courier New'";
+                c.fillText(`${STATE.currentHour} AM`, CONFIG.WIDTH - 120, 50);
+                c.font = "20px 'Courier New'";
+                c.fillText(`Night ${STATE.currentNight}`, CONFIG.WIDTH - 120, 80);
+
+                // Flashlight Battery Structural Bar Indicator Display Nodes
+                c.fillText("BATTERY:", 40, 50);
+                c.strokeStyle = "#fff";
+                c.strokeRect(140, 32, 100, 22);
+                c.fillStyle = STATE.flashlightBattery > 20 ? "#00ff00" : "#ff0000";
+                c.fillRect(142, 34, STATE.flashlightBattery * 0.96, 18);
+
+                // Interactive Target Command Nodes Bottom Zones
+                // Left Mask Toggle Interface Area Strip
+                c.fillStyle = "rgba(50, 0, 0, 0.6)";
+                c.fillRect(0, CONFIG.HEIGHT - 50, CONFIG.WIDTH/2 - 10, 50);
+                c.fillStyle = "#ff9999";
+                c.font = "16px sans-serif";
+                c.fillText("=== MASK ===", CONFIG.WIDTH/4 - 40, CONFIG.HEIGHT - 20);
+
+                // Right Monitor Toggle Interface Area Strip
+                c.fillStyle = "rgba(0, 50, 50, 0.6)";
+                c.fillRect(CONFIG.WIDTH/2 + 10, CONFIG.HEIGHT - 50, CONFIG.WIDTH/2 - 10, 50);
+                c.fillStyle = "#99ffff";
+                c.fillText("=== MONITOR ===", (CONFIG.WIDTH * 0.75) - 60, CONFIG.HEIGHT - 20);
+            },
+
+            renderJumpscare() {
+                let c = this.ctx;
+                STATE.jumpscareFrame++;
+                
+                // Procedural flash flicker dynamics scales updates
+                let scale = 1 + (STATE.jumpscareFrame * 0.15);
+                c.save();
+                c.translate(CONFIG.WIDTH/2, CONFIG.HEIGHT/2);
+                c.scale(scale, scale);
+
+                // Procedural Monster Geometry Cluster Drawing
+                c.fillStyle = "#3a2b23"; // Raw face mesh body color matrix block
+                c.beginPath();
+                c.arc(0, 0, 80, 0, Math.PI*2);
+                c.fill();
+
+                // Mechanical jaw system offset animations based on raw frames count math
+                let jawOffset = Math.sin(STATE.jumpscareFrame * 0.8) * 20;
+                c.fillStyle = "#1a110d";
+                c.fillRect(-60, 20, 120, 40 + jawOffset);
+
+                // Sharp Teeth Array Elements Matrix Iteration
+                c.fillStyle = "#fff";
+                for(let i = -50; i <= 50; i += 20) {
+                    c.fillRect(i, 20, 8, 12);
+                    c.fillRect(i, 40 + jawOffset, 8, -12);
+                }
+
+                // Pinpoint Crimson Pupil Laser Vectors
+                c.fillStyle = "#ff0000";
+                c.beginPath(); c.arc(-30, -20, 10, 0, Math.PI*2); c.fill();
+                c.beginPath(); c.arc(30, -20, 10, 0, Math.PI*2); c.fill();
+
+                c.restore();
+
+                if(STATE.jumpscareFrame > 90) { // Sequence terminates tracking node boundary at 1.5 seconds runtime
+                    STATE.jumpscareFrame = 0;
+                    GameEngine.terminateGame(false);
+                }
+            }
+        };
+
+        // ============================================================================
+        // 5. CORE SYSTEM DRIVER GAME ENGINE
+        // ============================================================================
+        const GameEngine = {
+            lastTickTime: 0,
+
+            init() {
+                VisualEngine.init();
+                AudioEngine.init();
+                AI_ENGINE.init();
+
+                // Bind Loop Drivers
+                this.lastTickTime = performance.now();
+                requestAnimationFrame((t) => this.loop(t));
+
+                // Set Precision Background Dynamic Clock Intervals
+                this.aiTimerId = setInterval(() => AI_ENGINE.tick(), CONFIG.AI_TICK_RATE);
+            },
+
+            loop(timestamp) {
+                this.update(timestamp);
+                VisualEngine.render();
+
+                if (!STATE.gameOver && !STATE.gameWon) {
+                    requestAnimationFrame((t) => this.loop(t));
+                } else {
+                    this.renderEndScreen();
+                }
+            },
+
+            update(timestamp) {
+                if(STATE.gameOver || STATE.gameWon) return;
+
+                // In-game real-time progression tracker operations
+                STATE.time += 16.67; // Simulated precise step framework increment equivalent 60hz frame timing bounds
+                
+                // Calculate standard hour markers updates based on linear parameters allocations maps
+                let totalHoursPassed = Math.floor(STATE.time / 60000); 
+                if(totalHoursPassed > 0) {
+                    let nextHour = 12 + totalHoursPassed;
+                    if(nextHour > 12) nextHour -= 12;
+                    if(nextHour !== STATE.currentHour) {
+                        STATE.currentHour = nextHour;
+                        AudioEngine.playTone(500, 'sine', 0.5, 0.3);
+                    }
+                }
+
+                if(STATE.time >= CONFIG.NIGHT_DURATION) {
+                    this.terminateGame(true);
+                    return;
+                }
+
+                // Update Systems Transitions
+                VisualEngine.updateTransitions();
+
+                // Process Tactical Force Entry Event Sequences Intersects
+                if(STATE.blackoutActive) {
+                    STATE.blackoutTimer--;
+                    if(STATE.blackoutTimer <= 0) {
+                        STATE.blackoutActive = false;
+                        this.evaluateOfficeDefenseResolution();
+                    }
+                }
+
+                // Direct Execution Check Against Passive Instant Lose Conditions
+                if(STATE.musicBoxWind <= 0 && AI_ENGINE.registry["Puppet"].inOffice) {
+                    this.triggerJumpscare("Puppet");
+                }
+            },
+
+            evaluateOfficeDefenseResolution() {
+                // Iterate through physical entities in high critical states to verify defensive mask checks
+                let deathTriggered = false;
+                for(let id in AI_ENGINE.registry) {
+                    let anim = AI_ENGINE.registry[id];
+                    if(anim.inOffice && id !== "Puppet") {
+                        if(STATE.maskEquipped && STATE.maskTransition >= 0.8) {
+                            // Successful structural deployment tactical mask resolution vectors
+                            anim.inOffice = false;
+                            anim.currentIdx = 0;
+                            anim.location = anim.path; // Reset sequence position indexes back to start node structures
+                        } else {
+                            this.triggerJumpscare(id);
+                            deathTriggered = true;
+                            break;
+                        }
+                    }
+                }
+            },
+
+            triggerJumpscare(id) {
+                if(STATE.gameOver) return;
+                STATE.gameOver = true;
+                STATE.jumpscaredBy = id;
+                AudioEngine.triggerSFX('scare');
+            },
+
+            terminateGame(victoryFlag) {
+                clearInterval(this.aiTimerId);
+                if(victoryFlag) {
+                    STATE.gameWon = true;
+                } else {
+                    STATE.gameOver = true;
+                }
+            },
+
+            renderEndScreen() {
+                let c = VisualEngine.ctx;
+                c.fillStyle = "#000000";
+                c.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+                c.fillStyle = STATE.gameWon ? "#00ff00" : "#ff0000";
+                c.font = "48px 'Courier New'";
+                c.textAlign = "center";
+                
+                if(STATE.gameWon) {
+                    c.fillText("6 AM", CONFIG.WIDTH/2, CONFIG.HEIGHT/2 - 20);
+                    c.font = "24px 'Courier New'";
+                    c.fillStyle = "#fff";
+                    c.fillText("NIGHT COMPLETED SUCCESSFULLY", CONFIG.WIDTH/2, CONFIG.HEIGHT/2 + 40);
+                } else {
+                    c.fillText("GAME OVER", CONFIG.WIDTH/2, CONFIG.HEIGHT/2 - 20);
+                    c.font = "18px 'Courier New'";
+                    c.fillStyle = "#666";
+                    c.fillText(`Killed by structural asset: ${STATE.jumpscaredBy || "Unknown Animatronic Structure"}`, CONFIG.WIDTH/2, CONFIG.HEIGHT/2 + 40);
+                }
+            }
+        };
+
+        // Auto-bootstrap runtime container on document validation completion events
+        window.onload = () => {
+            // Add User Interaction Modal Barrier step down node blocks to conform cleanly to global browser autoplay security standards
+            const container = document.getElementById("game-container");
+            const overlay = document.createElement("div");
+            overlay.style = "position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); display:flex; flex-direction:column; justify-content:center; align-items:center; z-index:999; cursor:pointer;";
+            overlay.innerHTML = "<h1 style='color:#fff; font-family:monospace; margin-bottom:20px;'>FNAF 2 WEB ENGINE ARCHITECTURE</h1><p style='color:#888; font-family:monospace;'>CLICK TERMINAL CONTAINER TO BOOTSTRAP SUBSYSTEMS</p>";
+            
+            container.appendChild(overlay);
+            overlay.addEventListener('click', () => {
+                overlay.remove();
+                GameEngine.init();
+            });
+        };
+    </script>
+<!-- Code injected by live-server -->
+<script>
+	// <![CDATA[  <-- For SVG support
+	if ('WebSocket' in window) {
+		(function () {
+			function refreshCSS() {
+				var sheets = [].slice.call(document.getElementsByTagName("link"));
+				var head = document.getElementsByTagName("head")[0];
+				for (var i = 0; i < sheets.length; ++i) {
+					var elem = sheets[i];
+					var parent = elem.parentElement || head;
+					parent.removeChild(elem);
+					var rel = elem.rel;
+					if (elem.href && typeof rel != "string" || rel.length == 0 || rel.toLowerCase() == "stylesheet") {
+						var url = elem.href.replace(/(&|\?)_cacheOverride=\d+/, '');
+						elem.href = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_cacheOverride=' + (new Date().valueOf());
+					}
+					parent.appendChild(elem);
+				}
+			}
+			var protocol = window.location.protocol === 'http:' ? 'ws://' : 'wss://';
+			var address = protocol + window.location.host + window.location.pathname + '/ws';
+			var socket = new WebSocket(address);
+			socket.onmessage = function (msg) {
+				if (msg.data == 'reload') window.location.reload();
+				else if (msg.data == 'refreshcss') refreshCSS();
+			};
+			if (sessionStorage && !sessionStorage.getItem('IsThisFirstTime_Log_From_LiveServer')) {
+				console.log('Live reload enabled.');
+				sessionStorage.setItem('IsThisFirstTime_Log_From_LiveServer', true);
+			}
+		})();
+	}
+	else {
+		console.error('Upgrade your browser. This Browser is NOT supported WebSocket for Live-Reloading.');
+	}
+	// ]]>
+</script>
+</body>
+</html>
